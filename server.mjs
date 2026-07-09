@@ -19,6 +19,13 @@ const PORT = process.env.PORT || 8787;
 const REGION = "us-east-1"; // MinIO ignores this; the SDK requires something set
 const UPLOAD_TTL_SECONDS = 300;
 const ALLOWED_CONTENT_TYPES = new Set(["video/mp4", "image/png", "image/jpeg"]);
+// this service has no CDN/rate-limiting in front of it and shares a VPS with
+// other live apps — a clip that actually goes viral would otherwise pull
+// unbounded egress bandwidth through that box forever. HARD_MAX_VIEWS is an
+// absolute ceiling: even a caller who asks for "unlimited" gets this instead,
+// no override possible short of redeploying with a different constant.
+const HARD_MAX_VIEWS = 1000;
+const NOTIFY_THRESHOLD = 500; // heads-up flag partway to the hard ceiling
 // base used to build the shortUrl returned from /presign and stored nowhere
 // permanent — change this env var and every clip's shortUrl recomputes
 // against the new base on the next list/presign call, no migration needed
@@ -117,9 +124,21 @@ function clipView(clip) {
     createdAt: clip.createdAt,
     views: clip.views,
     lastViewedAt: clip.lastViewedAt || null,
+    maxViews: clip.maxViews,
+    wasUnlimited: !!clip.wasUnlimited,
+    expiresAt: clip.expiresAt || null,
+    notifiedAt500: !!clip.notifiedAt500,
     publicUrl: publicUrlFor(clip.bucket, clip.key),
     shortUrl: shortUrlFor(clip.slug),
   };
+}
+
+function linkGoneHtml(reason) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Link unavailable</title>
+<style>body{font-family:system-ui,sans-serif;background:#12141a;color:#e2e5ea;display:flex;
+align-items:center;justify-content:center;height:100vh;margin:0}
+.card{text-align:center;padding:24px}</style></head>
+<body><div class="card"><h1>Link unavailable</h1><p>This link ${reason}.</p></div></body></html>`;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -150,7 +169,19 @@ const server = http.createServer(async (req, res) => {
         json(res, 404, { error: "clip not found" });
         return;
       }
-      await store.recordView(clip.slug);
+      const expired = clip.expiresAt && Date.now() > clip.expiresAt;
+      const capped = clip.maxViews != null && clip.views >= clip.maxViews;
+      if (expired || capped) {
+        res.writeHead(410, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(linkGoneHtml(expired ? "has expired" : "has reached its view limit"));
+        return;
+      }
+      const updated = await store.recordView(clip.slug);
+      // one-time latch at the halfway point to the hard ceiling — the
+      // extension polls for this flag and raises a desktop notification
+      if (updated.views >= NOTIFY_THRESHOLD && !updated.notifiedAt500) {
+        await store.markNotified500(clip.slug);
+      }
       res.writeHead(302, { Location: publicUrlFor(clip.bucket, clip.key) });
       res.end();
       return;
@@ -186,9 +217,22 @@ const server = http.createServer(async (req, res) => {
         new PutObjectCommand({ Bucket: tenant.bucket, Key: objectKey, ContentType: contentType }),
         { expiresIn: UPLOAD_TTL_SECONDS }
       );
+      // "unlimited" (maxViews omitted/null) still gets clamped to the hard
+      // ceiling — see HARD_MAX_VIEWS above. wasUnlimited is kept only so the
+      // UI can honestly show "Unlimited (capped at 1000)" instead of a
+      // number the caller never actually chose.
+      const wasUnlimited = body.maxViews == null;
+      const maxViews = Math.min(
+        wasUnlimited ? HARD_MAX_VIEWS : Math.max(1, Math.floor(body.maxViews)),
+        HARD_MAX_VIEWS
+      );
+      const expiresAt = body.expiresInDays
+        ? Date.now() + Math.max(1, Math.floor(body.expiresInDays)) * 86400000
+        : null;
       const clip = await store.createClip({
         slug, bucket: tenant.bucket, key: objectKey,
         filename: body.filename || objectKey, contentType, size: body.size || null,
+        maxViews, wasUnlimited, expiresAt,
       });
       json(res, 200, { uploadUrl, expiresIn: UPLOAD_TTL_SECONDS, ...clipView(clip) });
       return;

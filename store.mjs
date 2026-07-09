@@ -43,9 +43,12 @@ function mutate(fn) {
   return writeQueue;
 }
 
-export async function createClip({ slug, bucket, key, filename, contentType, size }) {
+export async function createClip({ slug, bucket, key, filename, contentType, size, maxViews, wasUnlimited, expiresAt }) {
   return mutate((db) => {
-    db[slug] = { slug, bucket, key, filename, contentType, size, createdAt: Date.now(), views: 0 };
+    db[slug] = {
+      slug, bucket, key, filename, contentType, size, createdAt: Date.now(), views: 0,
+      maxViews, wasUnlimited: !!wasUnlimited, expiresAt: expiresAt || null, notifiedAt500: false,
+    };
     return db[slug];
   });
 }
@@ -83,6 +86,18 @@ export async function recordView(slug) {
     if (!db[slug]) return null;
     db[slug].views = (db[slug].views || 0) + 1;
     db[slug].lastViewedAt = Date.now();
+    return db[slug];
+  });
+}
+
+// one-shot latch — the caller (server.mjs) checks `views` crossing the
+// threshold and calls this to record that the flag's been raised, so the
+// extension's poll (which watches notifiedAt500) only ever sees it flip
+// false -> true once per clip, never re-fires on every subsequent view
+export async function markNotified500(slug) {
+  return mutate((db) => {
+    if (!db[slug]) return null;
+    db[slug].notifiedAt500 = true;
     return db[slug];
   });
 }
