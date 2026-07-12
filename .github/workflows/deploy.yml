@@ -1,0 +1,55 @@
+name: Deploy to Coolify
+
+# Runs AFTER "Build Image" pushes the fresh image to GHCR, then tells Coolify to
+# pull it — so the deploy uses the NEW image, never a stale one (triggering on
+# `push` would race the image build). SSHes to jat-vps as `jw` (who can reach
+# Coolify on localhost:8000 — no root needed) and hits /api/v1/deploy. Coolify
+# stays Tailscale-only, never publicly exposed.
+#
+# Repo secrets required: VPS_HOST, DEPLOY_SSH_KEY (jw-authorized), COOLIFY_API_TOKEN.
+on:
+  workflow_run:
+    workflows: ["Build Image"]
+    types: [completed]
+  workflow_dispatch: {}
+
+concurrency:
+  group: coolify-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy clip.marduk.app
+    runs-on: ubuntu-latest
+    # workflow_run fires on ANY completion — only deploy on a successful build.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Trigger Coolify deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          APP_UUID: dy0ujve03hxoqvese97oe29r
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: jw
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command_timeout: 20m
+          envs: COOLIFY_TOKEN,APP_UUID
+          script: |
+            set -euo pipefail
+            BASE="http://localhost:8000/api/v1"
+            echo "Queueing deploy for $APP_UUID..."
+            response=$(curl -sf -H "Authorization: Bearer $COOLIFY_TOKEN" "$BASE/deploy?uuid=$APP_UUID&force=true" || true)
+            deploy_uuid=$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin)['deployments'][0]['deployment_uuid'])" 2>/dev/null || true)
+            if [ -z "$deploy_uuid" ]; then echo "FAILED to queue (response: $response)"; exit 1; fi
+            echo "Queued: $deploy_uuid"
+            # Poll to completion so a failed build fails the workflow.
+            deadline=$(( $(date +%s) + 900 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              status=$(curl -sf -H "Authorization: Bearer $COOLIFY_TOKEN" "$BASE/deployments/$deploy_uuid" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "")
+              echo "  status: ${status:-<unknown>}"
+              if [ "$status" = "finished" ]; then echo "Deploy finished"; exit 0; fi
+              if [ "$status" = "failed" ] || [ "$status" = "error" ]; then echo "Deploy FAILED"; exit 1; fi
+              sleep 15
+            done
+            echo "Timeout after 15 minutes"; exit 1
